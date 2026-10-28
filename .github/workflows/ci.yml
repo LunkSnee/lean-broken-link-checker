@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Oldest supported ("Requires PHP") and current.
+        php: ["7.4", "8.3"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer
+          coverage: none
+
+      - name: PHP syntax
+        run: find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 php -l
+
+      - name: PHPCS (WordPress security sniffs, PHP compatibility)
+        if: matrix.php == '8.3'
+        run: |
+          composer install --no-interaction --no-progress
+          composer lint
+
+  package:
+    name: Version check and package build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version consistency
+        run: bin/version.sh check
+
+      - name: Build plugin zip
+        run: bin/build.sh
