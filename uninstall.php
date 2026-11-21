@@ -20,6 +20,7 @@ delete_option( 'lean_blc_dismiss_notice' );
 delete_option( 'lean_blc_url_timestamps' );
 delete_option( 'lean_blc_version' );
 delete_option( 'lean_blc_scan_lock' );
+delete_option( 'lean_blc_host_backoff' );
 
 // Remove per-user notice dismissals
 delete_metadata( 'user', 0, 'lean_blc_dismissed_scan', '', true );

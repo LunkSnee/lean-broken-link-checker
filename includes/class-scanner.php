@@ -179,12 +179,118 @@ class Lean_BLC_Scanner {
 	}
 
 	/**
+	 * Lower-cased host of a URL ('' when it has none).
+	 */
+	private function get_host( $url ) {
+		return strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+	}
+
+	/**
+	 * Reorder URLs round-robin across hostnames so no single host is probed
+	 * back-to-back, while preserving the relative order within each host.
+	 * Linear time: a host leaves the rotation once its URLs run out.
+	 */
+	public function interleave_urls_by_host( $urls ) {
+		$buckets = array();
+		foreach ( $urls as $url ) {
+			$buckets[ $this->get_host( $url ) ][] = $url;
+		}
+
+		$interleaved = array();
+		for ( $round = 0; ! empty( $buckets ); ++$round ) {
+			$exhausted = array();
+			foreach ( $buckets as $host => $host_urls ) {
+				$interleaved[] = $host_urls[ $round ];
+				if ( ! isset( $host_urls[ $round + 1 ] ) ) {
+					$exhausted[] = $host;
+				}
+			}
+			foreach ( $exhausted as $host ) {
+				unset( $buckets[ $host ] );
+			}
+		}
+
+		return $interleaved;
+	}
+
+	/**
+	 * Parse an HTTP Retry-After header (delta-seconds or HTTP-date) into seconds, or null.
+	 */
+	public function parse_retry_after( $header ) {
+		if ( is_array( $header ) ) {
+			$header = reset( $header );
+		}
+		$header = trim( (string) $header );
+		if ( '' === $header ) {
+			return null;
+		}
+		if ( ctype_digit( $header ) ) {
+			return intval( $header );
+		}
+		$timestamp = strtotime( $header );
+		if ( false !== $timestamp ) {
+			return max( 0, $timestamp - time() );
+		}
+		return null;
+	}
+
+	/**
+	 * Seconds to leave a host alone after it answers 429: its Retry-After value,
+	 * or one hour without one, kept between one minute and one day.
+	 */
+	private function get_backoff_seconds( $retry_after ) {
+		if ( null === $retry_after ) {
+			$retry_after = HOUR_IN_SECONDS;
+		}
+		return min( DAY_IN_SECONDS, max( MINUTE_IN_SECONDS, (int) $retry_after ) );
+	}
+
+	/**
+	 * Hosts still backed off after a 429, as host => Unix time the backoff ends.
+	 */
+	private function load_host_backoff() {
+		$backoff = get_option( 'lean_blc_host_backoff', array() );
+		return is_array( $backoff ) ? $this->active_backoff( $backoff ) : array();
+	}
+
+	/**
+	 * Store the backoffs that have not expired yet (not autoloaded), or drop the option when none remain.
+	 */
+	private function save_host_backoff( $backoff ) {
+		$backoff = $this->active_backoff( $backoff );
+		if ( empty( $backoff ) ) {
+			delete_option( 'lean_blc_host_backoff' );
+		} else {
+			update_option( 'lean_blc_host_backoff', $backoff, false );
+		}
+	}
+
+	private function active_backoff( $backoff ) {
+		$now = time();
+		return array_filter(
+			$backoff,
+			function ( $until ) use ( $now ) {
+				return (int) $until > $now;
+			}
+		);
+	}
+
+	/**
 	 * Probe one URL, log the check, and record or clear its broken-link rows.
-	 * Returns 'broken', 'redirect' or 'healthy'.
+	 * A rate-limited (429) URL keeps any broken-link rows it already has.
+	 * Returns array( 'result' => 'healthy'|'redirect'|'rate_limited'|'broken', 'retry_after' => int|null ).
 	 */
 	private function check_url( $url, $post_ids, $settings ) {
 		$status_info = $this->probe_url( $url, $settings['timeout'] );
-		$result_type = $status_info['is_broken'] ? 'broken' : ( $status_info['is_redirect'] ? 'redirect' : 'healthy' );
+		if ( ! empty( $status_info['is_rate_limited'] ) ) {
+			$result_type = 'rate_limited';
+		} elseif ( $status_info['is_broken'] ) {
+			$result_type = 'broken';
+		} elseif ( $status_info['is_redirect'] ) {
+			$result_type = 'redirect';
+		} else {
+			$result_type = 'healthy';
+		}
 
 		Lean_BLC_DB::log_entry(
 			$url,
@@ -195,7 +301,7 @@ class Lean_BLC_Scanner {
 			$settings['max_log_rows']
 		);
 
-		if ( $status_info['is_broken'] ) {
+		if ( 'broken' === $result_type ) {
 			$wayback_url = null;
 			if ( $settings['auto_lookup_archive'] ) {
 				$snapshot    = Lean_BLC_Wayback::lookup_snapshot( $url );
@@ -204,11 +310,75 @@ class Lean_BLC_Scanner {
 			foreach ( $post_ids as $post_id ) {
 				Lean_BLC_DB::save_broken_link( $post_id, $url, $status_info['code'], $status_info['message'], $wayback_url );
 			}
-		} else {
+		} elseif ( 'rate_limited' !== $result_type ) {
 			Lean_BLC_DB::delete_by_url( $url );
 		}
 
-		return $result_type;
+		return array(
+			'result'      => $result_type,
+			'retry_after' => isset( $status_info['retry_after'] ) ? $status_info['retry_after'] : null,
+		);
+	}
+
+	/**
+	 * Probe up to $limit URLs from $queue in order, spacing requests and interleaving hosts.
+	 *
+	 * URLs on a host in $backoff (host => Unix time) are deferred without using a slot, and
+	 * a 429 adds its host to $backoff, so later URLs on that host are deferred too. Checked
+	 * URLs get a fresh timestamp; rate-limited and deferred URLs keep theirs, so they stay
+	 * first in line for when the host recovers.
+	 * Returns counts per result plus 'deferred' and 'probed'.
+	 */
+	private function probe_urls( $queue, $limit, $urls_to_posts, $settings, &$timestamps, &$backoff ) {
+		$delay_microseconds = intval( ( 60 / $settings['requests_per_minute'] ) * 1000000 );
+
+		$counts = array(
+			'broken'       => 0,
+			'redirect'     => 0,
+			'healthy'      => 0,
+			'rate_limited' => 0,
+			'deferred'     => 0,
+			'probed'       => 0,
+		);
+		$total = count( $queue );
+		$pos   = 0;
+
+		while ( $counts['probed'] < $limit && $pos < $total ) {
+			// Take the next URLs in queue order from hosts that are not backed off...
+			$chunk = array();
+			while ( count( $chunk ) < $limit - $counts['probed'] && $pos < $total ) {
+				$url  = $queue[ $pos++ ];
+				$host = $this->get_host( $url );
+				if ( isset( $backoff[ $host ] ) && time() < $backoff[ $host ] ) {
+					++$counts['deferred'];
+					continue;
+				}
+				$chunk[] = $url;
+			}
+
+			// ...then spread them across hosts. A host that answers 429 here is skipped for
+			// the rest of the chunk, and the next pass refills the freed slots.
+			foreach ( $this->interleave_urls_by_host( $chunk ) as $url ) {
+				$host = $this->get_host( $url );
+				if ( isset( $backoff[ $host ] ) && time() < $backoff[ $host ] ) {
+					++$counts['deferred'];
+					continue;
+				}
+				if ( $counts['probed'] > 0 && $delay_microseconds > 0 ) {
+					usleep( $delay_microseconds );
+				}
+				$check = $this->check_url( $url, $urls_to_posts[ $url ], $settings );
+				++$counts['probed'];
+				++$counts[ $check['result'] ];
+				if ( 'rate_limited' === $check['result'] ) {
+					$backoff[ $host ] = time() + $this->get_backoff_seconds( $check['retry_after'] );
+				} else {
+					$timestamps[ $url ] = time();
+				}
+			}
+		}
+
+		return $counts;
 	}
 
 	/**
@@ -217,25 +387,26 @@ class Lean_BLC_Scanner {
 	 * Returns the stats array, or a WP_Error if another run is in progress.
 	 */
 	public function run_cron_batch() {
-		$settings           = $this->get_settings();
-		$batch_size         = $settings['cron_batch_size'];
-		$delay_microseconds = intval( ( 60 / $settings['requests_per_minute'] ) * 1000000 );
-		$time_limit         = max( 600, $batch_size * ( $settings['timeout'] + 7 ) );
+		$settings   = $this->get_settings();
+		$batch_size = $settings['cron_batch_size'];
+		$time_limit = max( 600, $batch_size * ( $settings['timeout'] + 7 ) );
 
 		if ( ! $this->acquire_lock( $time_limit ) ) {
 			return new WP_Error( 'lean_blc_locked', 'Another link check is already running. Try again when it has finished.' );
 		}
 		$this->extend_time_limit( $time_limit );
 
-		// 1. Extract current inventory of unique links
+		// 1. Extract current inventory of unique links, and drop records of links no longer in content
 		$data          = $this->extract_all_links();
 		$urls_to_posts = $data['urls_to_posts'];
+		Lean_BLC_DB::prune_stale_links( $urls_to_posts );
 
-		// 2. Load audit timestamp registry
+		// 2. Load audit timestamp registry and host backoffs from earlier 429 responses
 		$timestamps = get_option( 'lean_blc_url_timestamps', array() );
 		if ( ! is_array( $timestamps ) ) {
 			$timestamps = array();
 		}
+		$backoff = $this->load_host_backoff();
 
 		// 3. Sort URLs by oldest check timestamp (0 = never checked)
 		$url_queue = array();
@@ -244,36 +415,24 @@ class Lean_BLC_Scanner {
 		}
 		asort( $url_queue );
 
-		// 4. Select the batch of oldest links
-		$batch_urls = array_slice( array_keys( $url_queue ), 0, $batch_size );
+		// 4. Probe the oldest batch, interleaved by host, with rate limiting and logging
+		$counts = $this->probe_urls( array_keys( $url_queue ), $batch_size, $urls_to_posts, $settings, $timestamps, $backoff );
+		$this->save_host_backoff( $backoff );
 
-		$counts = array(
-			'broken'   => 0,
-			'redirect' => 0,
-			'healthy'  => 0,
-		);
-
-		// 5. Probe each URL with rate limiting and log the check
-		foreach ( $batch_urls as $i => $url ) {
-			if ( $i > 0 && $delay_microseconds > 0 ) {
-				usleep( $delay_microseconds );
-			}
-			++$counts[ $this->check_url( $url, $urls_to_posts[ $url ], $settings ) ];
-			$timestamps[ $url ] = time();
-		}
-
-		// 6. Prune timestamps of removed URLs (not autoloaded: it grows with the site)
+		// 5. Prune timestamps of removed URLs (not autoloaded: it grows with the site)
 		$timestamps = array_intersect_key( $timestamps, $urls_to_posts );
 		update_option( 'lean_blc_url_timestamps', $timestamps, false );
 
-		// 7. Update statistics
+		// 6. Update statistics
 		$stats = array(
 			'last_updated'   => current_time( 'mysql' ),
 			'total_links'    => count( $data['links'] ),
 			'unique_urls'    => count( $urls_to_posts ),
-			'batch_checked'  => count( $batch_urls ),
+			'batch_checked'  => $counts['probed'],
 			'healthy'        => $counts['healthy'],
 			'redirected'     => $counts['redirect'],
+			'rate_limited'   => $counts['rate_limited'],
+			'deferred'       => $counts['deferred'],
 			'broken'         => Lean_BLC_DB::get_count(),
 			'cycle_progress' => count( array_filter( $timestamps ) ),
 		);
@@ -281,9 +440,9 @@ class Lean_BLC_Scanner {
 
 		$this->release_lock();
 
-		// 8. Notification if new broken links found
+		// 7. Notification if new broken links found
 		if ( $counts['broken'] > 0 && ! empty( $settings['send_email_report'] ) ) {
-			$this->dispatch_wordpress_notifications( $stats, count( $batch_urls ), $counts['broken'] );
+			$this->dispatch_wordpress_notifications( $stats, $counts['probed'], $counts['broken'] );
 		}
 
 		return $stats;
@@ -292,11 +451,11 @@ class Lean_BLC_Scanner {
 	/**
 	 * Run a full on-demand site scan (rate-limited).
 	 * Broken links are saved as they are found, so a run cut short by a timeout keeps its results.
+	 * Records of rate-limited or deferred URLs are kept until they can be checked.
 	 * Returns the stats array, or a WP_Error if another run is in progress.
 	 */
 	public function run_full_scan() {
-		$settings           = $this->get_settings();
-		$delay_microseconds = intval( ( 60 / $settings['requests_per_minute'] ) * 1000000 );
+		$settings = $this->get_settings();
 
 		$data          = $this->extract_all_links();
 		$urls_to_posts = $data['urls_to_posts'];
@@ -308,22 +467,12 @@ class Lean_BLC_Scanner {
 		}
 		$this->extend_time_limit( $time_limit );
 
-		Lean_BLC_DB::clear_all();
+		Lean_BLC_DB::prune_stale_links( $urls_to_posts );
 
-		$counts = array(
-			'broken'   => 0,
-			'redirect' => 0,
-			'healthy'  => 0,
-		);
 		$timestamps = array();
-
-		foreach ( $unique_urls as $i => $url ) {
-			if ( $i > 0 && $delay_microseconds > 0 ) {
-				usleep( $delay_microseconds );
-			}
-			++$counts[ $this->check_url( $url, $urls_to_posts[ $url ], $settings ) ];
-			$timestamps[ $url ] = time();
-		}
+		$backoff    = $this->load_host_backoff();
+		$counts     = $this->probe_urls( $unique_urls, count( $unique_urls ), $urls_to_posts, $settings, $timestamps, $backoff );
+		$this->save_host_backoff( $backoff );
 
 		update_option( 'lean_blc_url_timestamps', $timestamps, false );
 
@@ -331,18 +480,20 @@ class Lean_BLC_Scanner {
 			'last_updated'   => current_time( 'mysql' ),
 			'total_links'    => count( $data['links'] ),
 			'unique_urls'    => count( $unique_urls ),
-			'batch_checked'  => count( $unique_urls ),
+			'batch_checked'  => $counts['probed'],
 			'healthy'        => $counts['healthy'],
 			'redirected'     => $counts['redirect'],
+			'rate_limited'   => $counts['rate_limited'],
+			'deferred'       => $counts['deferred'],
 			'broken'         => Lean_BLC_DB::get_count(),
-			'cycle_progress' => count( $unique_urls ),
+			'cycle_progress' => count( array_filter( $timestamps ) ),
 		);
 		update_option( 'lean_blc_stats', $stats );
 
 		$this->release_lock();
 
 		if ( $counts['broken'] > 0 && ! empty( $settings['send_email_report'] ) ) {
-			$this->dispatch_wordpress_notifications( $stats, count( $unique_urls ), $counts['broken'] );
+			$this->dispatch_wordpress_notifications( $stats, $counts['probed'], $counts['broken'] );
 		}
 
 		return $stats;
@@ -441,20 +592,24 @@ class Lean_BLC_Scanner {
 			);
 		}
 
-		$code = wp_remote_retrieve_response_code( $response );
-		$is_broken = ( $code >= 400 || $code === 0 );
-		$is_redirect = ( $code >= 300 && $code < 400 );
-		$msg = wp_remote_retrieve_response_message( $response );
+		$code            = wp_remote_retrieve_response_code( $response );
+		$is_rate_limited = ( 429 === $code );
+		$retry_after     = $is_rate_limited ? $this->parse_retry_after( wp_remote_retrieve_header( $response, 'retry-after' ) ) : null;
+		$is_broken       = ( ! $is_rate_limited && ( $code >= 400 || 0 === $code ) );
+		$is_redirect     = ( $code >= 300 && $code < 400 );
+		$msg             = wp_remote_retrieve_response_message( $response );
 		if ( empty( $msg ) ) {
-			$msg = ( $code === 200 ) ? 'OK' : ( $is_redirect ? 'Redirect' : 'HTTP ' . $code );
+			$msg = ( 200 === $code ) ? 'OK' : ( $is_redirect ? 'Redirect' : ( $is_rate_limited ? 'Too Many Requests' : 'HTTP ' . $code ) );
 		}
 
 		return array(
-			'is_broken'   => $is_broken,
-			'is_redirect' => $is_redirect,
-			'code'        => $code,
-			'duration_ms' => $duration_ms,
-			'message'     => $msg,
+			'is_broken'       => $is_broken,
+			'is_redirect'     => $is_redirect,
+			'is_rate_limited' => $is_rate_limited,
+			'retry_after'     => $retry_after,
+			'code'            => $code,
+			'duration_ms'     => $duration_ms,
+			'message'         => $msg,
 		);
 	}
 }

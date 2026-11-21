@@ -79,12 +79,27 @@ class Lean_BLC_DB {
 	}
 
 	/**
-	 * Clear all entries from broken links table before a new complete scan.
+	 * Delete records whose link is no longer in that post's published content.
+	 * $urls_to_posts maps each current URL to the IDs of the posts that contain it.
+	 * Returns the number of records deleted.
 	 */
-	public static function clear_all() {
+	public static function prune_stale_links( $urls_to_posts ) {
 		global $wpdb;
 		$table_name = self::get_table_name();
-		$wpdb->query( "TRUNCATE TABLE {$table_name}" );
+
+		$rows = $wpdb->get_results( "SELECT id, post_id, url FROM {$table_name}", ARRAY_A );
+		if ( ! is_array( $rows ) ) {
+			return 0;
+		}
+
+		$deleted = 0;
+		foreach ( $rows as $row ) {
+			$post_ids = isset( $urls_to_posts[ $row['url'] ] ) ? array_map( 'intval', $urls_to_posts[ $row['url'] ] ) : array();
+			if ( ! in_array( (int) $row['post_id'], $post_ids, true ) ) {
+				$deleted += (int) $wpdb->delete( $table_name, array( 'id' => (int) $row['id'] ), array( '%d' ) );
+			}
+		}
+		return $deleted;
 	}
 
 	/**
@@ -255,7 +270,7 @@ class Lean_BLC_DB {
 		global $wpdb;
 		$table_name = self::get_log_table_name();
 
-		if ( ! empty( $result_filter ) && in_array( $result_filter, array( 'healthy', 'redirect', 'broken' ), true ) ) {
+		if ( ! empty( $result_filter ) && in_array( $result_filter, array( 'healthy', 'redirect', 'rate_limited', 'broken' ), true ) ) {
 			$results = $wpdb->get_results(
 				$wpdb->prepare(
 					"SELECT * FROM {$table_name} WHERE result = %s ORDER BY id DESC LIMIT %d",
