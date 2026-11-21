@@ -3,7 +3,7 @@
  * Plugin Name: Lean Broken Link Checker
  * Plugin URI: https://github.com/LunkSnee/lean-broken-link-checker
  * Description: Ultra-lightweight, zero-DB-bloat link scanner with Wayback Machine auto-reconnect, continuous cron cycling, and detailed activity logs. <a href="tools.php?page=lean-broken-links&tab=settings">Configure Settings</a>
- * Version: 1.3.0
+ * Version: 1.3.1
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Author: LunkSnee
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'LEAN_BLC_VERSION', '1.3.0' );
+define( 'LEAN_BLC_VERSION', '1.3.1' );
 define( 'LEAN_BLC_DIR', plugin_dir_path( __FILE__ ) );
 define( 'LEAN_BLC_URL', plugin_dir_url( __FILE__ ) );
 

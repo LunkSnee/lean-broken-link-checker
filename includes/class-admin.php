@@ -420,6 +420,7 @@ class Lean_BLC_Admin {
 						<li><a href="?page=lean-broken-links&tab=log" class="<?php echo empty( $log_filter ) ? 'current' : ''; ?>">All Events</a> |</li>
 						<li><a href="?page=lean-broken-links&tab=log&filter=healthy" class="<?php echo $log_filter === 'healthy' ? 'current' : ''; ?>">Healthy (200)</a> |</li>
 						<li><a href="?page=lean-broken-links&tab=log&filter=redirect" class="<?php echo $log_filter === 'redirect' ? 'current' : ''; ?>">Redirects (3xx)</a> |</li>
+						<li><a href="?page=lean-broken-links&tab=log&filter=rate_limited" class="<?php echo $log_filter === 'rate_limited' ? 'current' : ''; ?>">Rate Limited (429)</a> |</li>
 						<li><a href="?page=lean-broken-links&tab=log&filter=broken" class="<?php echo $log_filter === 'broken' ? 'current' : ''; ?>">Failures / Broken</a></li>
 					</ul>
 					<div>
@@ -450,6 +451,9 @@ class Lean_BLC_Admin {
 								} elseif ( $result === 'redirect' ) {
 									$badge_bg = '#dba617';
 									$badge_text = $entry['status_code'] ? $entry['status_code'] . ' Redirect' : 'Redirect';
+								} elseif ( $result === 'rate_limited' ) {
+									$badge_bg = '#996800';
+									$badge_text = $entry['status_code'] ? $entry['status_code'] . ' Rate Limited' : 'Rate Limited';
 								} else {
 									$badge_bg = '#d63638';
 									$badge_text = $entry['status_code'] ? $entry['status_code'] . ' Error' : 'Failed';

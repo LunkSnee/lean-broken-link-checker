@@ -28,7 +28,7 @@ class Lean_BLC_CLI {
 				$stats['broken'],
 				$stats['cycle_progress'],
 				$stats['unique_urls']
-			)
+			) . $this->rate_limit_summary( $stats )
 		);
 	}
 
@@ -48,15 +48,14 @@ class Lean_BLC_CLI {
 			WP_CLI::error( $stats->get_error_message() );
 		}
 
-		WP_CLI::success(
-			sprintf(
-				'Scan finished! Total: %d | Healthy: %d | Redirects: %d | Broken: %d',
-				$stats['total_links'],
-				$stats['healthy'],
-				$stats['redirected'],
-				$stats['broken']
-			)
+		$summary = sprintf(
+			'Scan finished! Total: %d | Healthy: %d | Redirects: %d | Broken: %d',
+			$stats['total_links'],
+			$stats['healthy'],
+			$stats['redirected'],
+			$stats['broken']
 		);
+		WP_CLI::success( $summary . $this->rate_limit_summary( $stats ) );
 
 		if ( $stats['broken'] > 0 ) {
 			$broken_items = Lean_BLC_DB::get_broken_links( 500, 0 );
@@ -165,6 +164,22 @@ class Lean_BLC_CLI {
 		} else {
 			WP_CLI::success( sprintf( 'Successfully replaced link in post %d.', $post_id ) );
 		}
+	}
+
+	/**
+	 * " | Rate Limited: N | Deferred: N" for a run that hit 429s, or ''.
+	 * Rate Limited counts URLs that answered 429; Deferred counts URLs skipped
+	 * because their host is backed off.
+	 */
+	private function rate_limit_summary( $stats ) {
+		$summary = '';
+		if ( ! empty( $stats['rate_limited'] ) ) {
+			$summary .= sprintf( ' | Rate Limited: %d', $stats['rate_limited'] );
+		}
+		if ( ! empty( $stats['deferred'] ) ) {
+			$summary .= sprintf( ' | Deferred: %d', $stats['deferred'] );
+		}
+		return $summary;
 	}
 }
 

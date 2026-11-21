@@ -2,6 +2,14 @@
 
 All notable changes to this plugin. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-11-21
+### Fixed
+- HTTP `429 Too Many Requests` responses are no longer recorded as broken links. They are logged as `rate_limited` in the Activity Log (with a dedicated filter), keep any broken-link record they already had, and keep their check timestamp so they are retried first.
+- A host that answers `429` is backed off until its `Retry-After` time (one hour without one, at most one day). The backoff is remembered between runs, and its URLs no longer take up places in a cron batch: the batch fills with links from other hosts.
+- Cron batches still check the oldest links first, and spread each batch across hosts so a single host is not probed back-to-back. Full scans are spread across hosts too.
+- A full scan no longer wipes all broken-link records before it starts. It removes only records for links no longer in published content, so a scan cut short or blocked by a `429` keeps the records it could not recheck. Cron batches now remove those stale records too.
+- Wayback Machine availability lookups are skipped for URLs that already point to `archive.org` / `web.archive.org`.
+
 ## [1.3.0] - 2026-10-28
 ### Security
 - Link checks no longer follow redirects to internal addresses. Before, a link to an outside site that redirected to a private or loopback address (for example a cloud metadata service) was requested from the server, and the link was reported healthy. Every redirect is now validated (`wp_safe_remote_request()`), and such links are logged as blocked.

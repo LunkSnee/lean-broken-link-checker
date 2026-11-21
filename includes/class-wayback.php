@@ -6,11 +6,19 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Lean_BLC_Wayback {
 
 	/**
+	 * Check whether a URL already points to archive.org (e.g. web.archive.org).
+	 */
+	public static function is_archive_url( $url ) {
+		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+		return ( 'archive.org' === $host || substr( $host, -12 ) === '.archive.org' );
+	}
+
+	/**
 	 * Query the Wayback Machine Availability API for an archived snapshot.
 	 */
 	public static function lookup_snapshot( $url ) {
-		// Validate URL before outbound request
-		if ( ! wp_http_validate_url( $url ) ) {
+		// Validate URL before outbound request and never look up URLs already on archive.org.
+		if ( ! wp_http_validate_url( $url ) || self::is_archive_url( $url ) ) {
 			return null;
 		}
 
